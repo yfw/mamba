@@ -54,7 +54,31 @@ def rearrange_and_update_stride(tensor, pattern=None, dim=2):
     # ensure tensor.stride(dim) is a multiple of eight after rearranging according to pattern,
     # if not call contiguous(), rearrange only if pattern is not None
     tensor_rearranged = rearrange(tensor, pattern) if pattern is not None else tensor
-    return tensor_rearranged.contiguous() if tensor_rearranged.stride(dim) % 8 != 0 else tensor_rearranged
+    # Fix: When stride alignment is needed, create a channel-last contiguous tensor
+    # instead of a regular contiguous tensor. For shape (batch, dim, seqlen),
+    # channel-last requires stride(1)=1 (channels contiguous) and stride(2)=dim.
+    if tensor_rearranged.stride(dim) % 8 != 0:
+        # Create a new contiguous tensor and then clone with channel-last memory format
+        # For 3D tensors with shape (batch, channels, length), we want channels_last
+        if tensor_rearranged.ndim == 3 and dim == 2:
+            # Use empty + copy to create channel-last layout
+            # Calculate required strides: stride(1)=1, stride(2) must be multiple of 8
+            batch, channels, length = tensor_rearranged.shape
+            # Ensure stride(2) is a multiple of 8 by padding channels if needed
+            channels_padded = ((channels + 7) // 8) * 8
+            # Create output with proper channel-last strides
+            output = torch.empty(batch, channels_padded, length, 
+                               dtype=tensor_rearranged.dtype, 
+                               device=tensor_rearranged.device)
+            # Set strides manually: (channels_padded * length, 1, channels_padded)
+            output = output.as_strided((batch, channels, length), 
+                                      (channels_padded * length, 1, channels_padded))
+            output.copy_(tensor_rearranged)
+            return output
+        else:
+            # Fallback to contiguous for non-3D cases or different dim
+            return tensor_rearranged.contiguous()
+    return tensor_rearranged
 
 
 @triton.autotune(
