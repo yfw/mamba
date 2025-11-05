@@ -58,21 +58,18 @@ def rearrange_and_update_stride(tensor, pattern=None, dim=2):
     # instead of a regular contiguous tensor. For shape (batch, dim, seqlen),
     # channel-last requires stride(1)=1 (channels contiguous) and stride(2)=dim.
     if tensor_rearranged.stride(dim) % 8 != 0:
-        # Create a new contiguous tensor and then clone with channel-last memory format
+        # Create a new contiguous tensor with channel-last layout
         # For 3D tensors with shape (batch, channels, length), we want channels_last
         if tensor_rearranged.ndim == 3 and dim == 2:
-            # Use empty + copy to create channel-last layout
-            # Calculate required strides: stride(1)=1, stride(2) must be multiple of 8
+            # Create channel-last layout: stride(1)=1, stride(2)=channels, stride(0)=channels*length
+            # This ensures stride(2) equals the channel dimension.
             batch, channels, length = tensor_rearranged.shape
-            # Ensure stride(2) is a multiple of 8 by padding channels if needed
-            channels_padded = ((channels + 7) // 8) * 8
-            # Create output with proper channel-last strides
-            output = torch.empty(batch, channels_padded, length, 
-                               dtype=tensor_rearranged.dtype, 
-                               device=tensor_rearranged.device)
-            # Set strides manually: (channels_padded * length, 1, channels_padded)
-            output = output.as_strided((batch, channels, length), 
-                                      (channels_padded * length, 1, channels_padded))
+            output = torch.empty_like(tensor_rearranged)
+            # Manually set channel-last strides: (channels * length, 1, channels)
+            output = output.as_strided(
+                (batch, channels, length),
+                (channels * length, 1, channels)
+            )
             output.copy_(tensor_rearranged)
             return output
         else:
