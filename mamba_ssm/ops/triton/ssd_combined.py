@@ -50,15 +50,32 @@ def init_to_zero(names):
     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
 
 
-def make_channel_last_stride(tensor):
-    batch, channels, length = tensor.shape
-    if tensor.stride(2) == channels:
-        return tensor
-    
-    output = torch.empty_like(tensor)
-    output = output.as_strided((batch, channels, length), (channels * length, 1, channels))
-    output.copy_(tensor)
-    return output
+def rearrange_and_update_stride(tensor, pattern=None, dim=2):
+    # ensure tensor.stride(dim) is a multiple of eight after rearranging according to pattern,
+    # if not call contiguous(), rearrange only if pattern is not None
+    tensor_rearranged = rearrange(tensor, pattern) if pattern is not None else tensor
+    # Fix: When stride alignment is needed, create a channel-last contiguous tensor
+    # instead of a regular contiguous tensor. For shape (batch, dim, seqlen),
+    # channel-last requires stride(1)=1 (channels contiguous) and stride(2)=dim.
+    if tensor_rearranged.stride(dim) % 8 != 0:
+        # Create a new contiguous tensor with channel-last layout
+        # For 3D tensors with shape (batch, channels, length), we want channels_last
+        if tensor_rearranged.ndim == 3 and dim == 2:
+            # Create channel-last layout: stride(1)=1, stride(2)=channels, stride(0)=channels*length
+            # This ensures stride(2) equals the channel dimension.
+            batch, channels, length = tensor_rearranged.shape
+            output = torch.empty_like(tensor_rearranged)
+            # Manually set channel-last strides: (channels * length, 1, channels)
+            output = output.as_strided(
+                (batch, channels, length),
+                (channels * length, 1, channels)
+            )
+            output.copy_(tensor_rearranged)
+            return output
+        else:
+            # Fallback to contiguous for non-3D cases or different dim
+            return tensor_rearranged.contiguous()
+    return tensor_rearranged
 
 
 @triton.autotune(
@@ -793,7 +810,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
-            causal_conv1d_fwd_function(make_channel_last_stride(rearrange(xBC, "b s d -> b d s")),
+            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
@@ -867,7 +884,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
         # Recompute x, B, C
         xBC_conv = rearrange(
-            causal_conv1d_fwd_function(make_channel_last_stride(rearrange(xBC, "b s d -> b d s")),
+            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
                                        conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
@@ -918,8 +935,8 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_weight, doutproj_bias = None, None
         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
-            make_channel_last_stride(rearrange(xBC, "b s d -> b d s")), conv1d_weight, conv1d_bias,
-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, make_channel_last_stride(dxBC_given), False, ctx.activation in ["silu", "swish"]
+            rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, ctx.activation in ["silu", "swish"]
         )
         if dxBC_given.stride() != dxBC_given_update.stride():
             dxBC_given.copy_(dxBC_given_update)
